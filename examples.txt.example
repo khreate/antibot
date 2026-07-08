@@ -1,0 +1,25 @@
+# Optional few-shot voice examples appended to the system prompt.
+# Copy this file to `examples.txt` and paste in real conversation excerpts that
+# capture the tone/cadence you want the bot to mimic.
+#
+# Rules:
+#   - Lines starting with `#` are stripped as comments.
+#   - Everything else is passed through mostly as-is; the loader auto-strips
+#     Discord chrome (bracketed timestamps like `[4:59 PM]` and `(edited)`
+#     markers) so raw copy-paste from Discord works.
+#   - Re-read every generation, so edits take effect on the next reply without
+#     a bot restart.
+#   - Set `EXAMPLES_PATH = None` (or "") in config.py to disable entirely.
+#
+# Format is flexible. Anything Discord-shaped works, e.g.:
+#
+#   alice: this game is dogshit
+#   bob: yeah i uninstalled
+#   khronic: it was never gonna be good
+#
+# Or raw copy-paste including usernames and role tags:
+#
+#   [4:59 PM]alice [FMHY], :
+#   this game is dogshit
+#   [5:00 PM]bob:
+#   yeah i uninstalled

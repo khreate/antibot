@@ -1,0 +1,34 @@
+# --- Local/private config (see *.example counterparts) ---
+.env
+config.py
+examples.txt
+
+# --- Runtime data ---
+sentient_bot.db
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# --- Virtualenv ---
+env/
+venv/
+.venv/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
