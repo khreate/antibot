@@ -35,32 +35,32 @@ Central design principle: **the bot's initiative is not gated on incoming messag
 ```mermaid
 flowchart TD
     D[Discord Gateway] -->|on_message| B[bot.on_message]
-    B --> AC{addressed?<br/>@mention / reply / DM /<br/>name / follow-up}
-    AC -- yes --> INJ[_check_injection<br/>fire-and-forget]
+    B --> AC{"addressed?<br/>mention / reply / DM /<br/>name / follow-up"}
+    AC -- yes --> INJ["_check_injection<br/>(fire-and-forget)"]
     AC -- yes --> COA[coalesce buffer]
     COA -->|after COALESCE_WINDOW| GR[generate_reply]
     AC -- no --> TR[track message in memory]
     GR --> WEB{needs web?}
-    WEB -- ask --> ASK[reply: 'want me to look?']
+    WEB -- ask --> ASK["reply: 'want me to look?'"]
     WEB -- context --> LLM[llm_client.chat]
     WEB -- none --> LLM
     GR --> LLM
-    LLM --> OLL[(Ollama<br/>local model)]
-    LLM --> THR{[[thread:]]<br/>directive?}
+    LLM --> OLL[("Ollama<br/>local model")]
+    LLM --> THR{"thread directive?"}
     THR -- yes --> MKTHR[create thread]
     LLM --> SEND[send_message]
-    GR --> SUM[maybe_summarize<br/>fire-and-forget]
+    GR --> SUM["maybe_summarize<br/>(fire-and-forget)"]
     SUM --> LLM
 
-    ATT[attention_loop<br/>every ~90s] --> HIST[channel.history]
+    ATT["attention_loop<br/>every ~90s"] --> HIST[channel.history]
     HIST --> LLM
     LLM --> REACT[add_reaction]
 
-    AUT[autonomy_loop<br/>every 5 min] --> MODE{idle vs active}
+    AUT["autonomy_loop<br/>every 5 min"] --> MODE{idle vs active}
     MODE -- idle --> LLM
     MODE -- active --> LLM
 
-    MEM[(SQLite<br/>Memory)]
+    MEM[("SQLite<br/>Memory")]
     GR <--> MEM
     TR --> MEM
     SUM --> MEM
