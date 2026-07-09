@@ -47,7 +47,7 @@ Then set `MODEL_NAME=khronic` in your `.env`.
 **Optional: image understanding (vision).** Enabled by default (`VISION_ENABLED = True`). It uses a *separate* vision-capable model because Dolphin-Mistral is text-only. Pull one:
 
 ```bash
-ollama pull qwen2.5vl:7b
+ollama pull qwen3-vl:8b
 ```
 
 The vision model is only ever invoked when an incoming message actually has image attachments, so text-only messages cost nothing extra. Its description is folded into the message text as plain context and the normal khronic persona handles the reply — the vision model never speaks to users. Override the model with `VISION_MODEL_NAME` in `.env`, or set `VISION_ENABLED = False` in `config.py` to turn the feature off entirely.

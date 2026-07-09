@@ -221,7 +221,7 @@ All in [config.py](config.py). Env vars override defaults via `.env` (loaded by 
 
 ### Vision (image understanding)
 - `VISION_ENABLED` (True) — master switch. When off, `vision.describe_attachments` returns `None` before any work.
-- `VISION_MODEL_NAME` (`"qwen2.5vl:7b"`, env-overridable) — a *separate* Ollama model from `MODEL_NAME` because Dolphin-Mistral is text-only. Passed to `llm_client.chat(..., model=...)`.
+- `VISION_MODEL_NAME` (`"qwen3-vl:8b"`, env-overridable) — a *separate* Ollama model from `MODEL_NAME` because Dolphin-Mistral is text-only. Passed to `llm_client.chat(..., model=...)`.
 - `VISION_MAX_TOKENS` (300) — cap on the description length per image.
 - `VISION_MAX_IMAGES_PER_MESSAGE` (3) — caps how many attachments one message can spend vision calls on, so an image dump can't stall the reply.
 - `VISION_TIMEOUT_SECONDS` (30.0) — per-message cap on download + model time combined.

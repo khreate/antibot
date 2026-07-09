@@ -154,7 +154,7 @@ INJECTION_LLM_CLASSIFIER_ENABLED = False  # one extra LLM call per addressed mes
 # description it produces gets folded into the message text as plain context, then the normal
 # khronic persona/model handles the actual reply -- Qwen never talks to the user directly.
 VISION_ENABLED = True
-VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "qwen2.5vl:7b")
+VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "qwen3-vl:8b")
 VISION_MAX_TOKENS = 300
 VISION_MAX_IMAGES_PER_MESSAGE = 3     # cap so someone dumping a pile of images doesn't stall the reply
 VISION_TIMEOUT_SECONDS = 30.0        # per-message cap on download + model time combined
