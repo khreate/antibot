@@ -144,3 +144,22 @@ GUILD_CHANNEL_RESTRICTIONS: dict[int, list[int]] = {}
 # asyncio.create_task) so it never adds latency to the user's response.
 INJECTION_DETECTION_ENABLED = True
 INJECTION_LLM_CLASSIFIER_ENABLED = False  # one extra LLM call per addressed message; off by default
+
+# --- Vision (image understanding via Qwen-VL, also through Ollama) ---
+# Pull a vision-capable Qwen model first, e.g.:
+#   ollama pull qwen2.5vl:7b
+# A *separate* model from MODEL_NAME on purpose -- Dolphin-Mistral is text-only. Vision is only
+# invoked when an incoming Discord message actually has image attachments (checked before any
+# network/model call happens), so it costs nothing on ordinary text-only messages. The
+# description it produces gets folded into the message text as plain context, then the normal
+# khronic persona/model handles the actual reply -- Qwen never talks to the user directly.
+VISION_ENABLED = True
+VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "qwen2.5vl:7b")
+VISION_MAX_TOKENS = 300
+VISION_MAX_IMAGES_PER_MESSAGE = 3     # cap so someone dumping a pile of images doesn't stall the reply
+VISION_TIMEOUT_SECONDS = 30.0        # per-message cap on download + model time combined
+# Whether to run vision analysis on messages that AREN'T addressed to the bot (i.e. images
+# posted in normal channel chatter it's just watching). Keep True so the bot can later reference
+# or react to an image via the attention/autonomy loops or a follow-up; set False to only ever
+# analyze images in messages that directly address the bot, if you want to keep it cheaper.
+VISION_ANALYZE_PASSIVE = True

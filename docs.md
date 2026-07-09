@@ -20,7 +20,8 @@ Central design principle: **the bot's initiative is not gated on incoming messag
 | [config.py](config.py) | Environment loading + all tunable knobs (probabilities, cooldowns, memory sizes, model name). Git-ignored — a `config.example.py` template ships in the repo. |
 | [persona.py](persona.py) | All prompt templates: main persona, `sandwich_messages`, summarization, mood, attention/follow-up decisions, web-search prompts, injection classifier. The "identity." |
 | [memory.py](memory.py) | `Memory` class — SQLite-backed persistence for messages, per-user profiles, and per-channel state (mood, last-summarized watermark, last message timestamp). |
-| [llm_client.py](llm_client.py) | Thin async wrapper around the Ollama `/api/chat` endpoint. `chat(messages, temperature=?, max_tokens=?, repeat_penalty=?) -> str`. |
+| [llm_client.py](llm_client.py) | Thin async wrapper around the Ollama `/api/chat` endpoint. `chat(messages, temperature=?, max_tokens=?, repeat_penalty=?, model=?) -> str`. The `model` override lets a single call target a different Ollama model (used by `vision.py`). |
+| [vision.py](vision.py) | Image understanding via a Qwen-VL model on Ollama. `describe_attachments(attachments)` filters image attachments, downloads them, and returns a compact factual description block to fold into the message text. A cheap no-op when there are no images. |
 | [web_search.py](web_search.py) | DuckDuckGo text search via the `ddgs` package. Runs off-loop with a hard timeout; returns `[]` on any failure so callers treat it as best-effort. |
 | [guard.py](guard.py) | Prompt-injection detection: cheap regex first-pass + optional LLM classifier. Detection only — the persona is the actual defense. |
 | [.env](.env) | `DISCORD_TOKEN` and optional overrides. Git-ignored; template is `.env.example`. |
@@ -78,6 +79,10 @@ flowchart TD
    - **Active mode**: channel active within `AUTONOMY_ACTIVE_MAX_IDLE_MINUTES`, bot hasn't self-chimed here in `AUTONOMY_ACTIVE_MIN_SINCE_LAST_BOT_MINUTES`. Roll `AUTONOMY_ACTIVE_CHANCE`. This is the "just felt like saying something" chime-in that isn't wired to any specific incoming message. Skips DMs (they already always get replies).
 
 Both autonomy modes get an `AUTONOMY_PROMPT_SUFFIX` that gives the model an explicit `[SKIP]` escape hatch. Direct replies also honor `[SKIP]` — the persona allows it rarely.
+
+### Vision pre-processing
+
+Before any path is chosen, `on_message` runs a vision pass: if the message has attachments and either it's addressed or `VISION_ANALYZE_PASSIVE` is set, `vision.describe_attachments` filters for image types, downloads each (capped at `VISION_MAX_IMAGES_PER_MESSAGE`), and runs them through `VISION_MODEL_NAME` on Ollama for a neutral factual description. That description is concatenated onto the message `text` **before** memory storage, injection scanning, follow-up detection, and reply generation — so every downstream path just sees more text and needs no vision-specific handling. The Qwen-VL model never speaks to users; it only produces context the khronic persona then reacts to. With no image attachments (the overwhelming majority of messages) it's a pure no-op: `describe_attachments` returns `None` before any network or model call. This is inline `await`, so a message with images can add up to `VISION_TIMEOUT_SECONDS` before the reply — acceptable because discord.py dispatches `on_message` per message, so other channels aren't blocked.
 
 ### Coalescer
 
@@ -214,6 +219,14 @@ All in [config.py](config.py). Env vars override defaults via `.env` (loaded by 
 - `WEB_SEARCH_MAX_RESULTS` (5), `WEB_SEARCH_REGION` (`"wt-wt"`), `WEB_SEARCH_TIMEOUT_SECONDS` (8.0)
 - `WEB_SEARCH_USE_LLM_GATE` (True) — let the model refine the query / veto pointless lookups via `NO_SEARCH`.
 
+### Vision (image understanding)
+- `VISION_ENABLED` (True) — master switch. When off, `vision.describe_attachments` returns `None` before any work.
+- `VISION_MODEL_NAME` (`"qwen2.5vl:7b"`, env-overridable) — a *separate* Ollama model from `MODEL_NAME` because Dolphin-Mistral is text-only. Passed to `llm_client.chat(..., model=...)`.
+- `VISION_MAX_TOKENS` (300) — cap on the description length per image.
+- `VISION_MAX_IMAGES_PER_MESSAGE` (3) — caps how many attachments one message can spend vision calls on, so an image dump can't stall the reply.
+- `VISION_TIMEOUT_SECONDS` (30.0) — per-message cap on download + model time combined.
+- `VISION_ANALYZE_PASSIVE` (True) — whether to also describe images in messages the bot wasn't addressed on (so it can reference them later via the attention/autonomy loops). Set `False` to only spend vision calls on images in messages that directly address the bot.
+
 ### Message shaping
 - `MAX_MESSAGE_CHARS` (300) — soft cap per Discord message; sentence-boundary aware.
 - `MAX_REPLY_MESSAGES` (6) — safety valve so a runaway reply can't flood a channel.
@@ -293,7 +306,7 @@ Extend `should_respond` in [bot.py](bot.py) or the follow-up gate. Whatever you 
 
 ### 7.8 Swap the model or backend
 
-[llm_client.py](llm_client.py) is the only place that talks to Ollama. To point at a different backend (OpenAI-compatible endpoint, llama.cpp server, remote API), reimplement `chat(messages, *, temperature=None, max_tokens=None, repeat_penalty=None) -> str` there. Nothing else in the codebase needs to know.
+[llm_client.py](llm_client.py) is the only place that talks to Ollama. To point at a different backend (OpenAI-compatible endpoint, llama.cpp server, remote API), reimplement `chat(messages, *, temperature=None, max_tokens=None, repeat_penalty=None, model=None) -> str` there. Nothing else in the codebase needs to know. Keep the `model` override working if you use vision — `vision.py` relies on it to route image calls to `VISION_MODEL_NAME` while the persona keeps using `MODEL_NAME`. A message dict may also carry an `"images": [base64, ...]` key for multimodal calls; Ollama reads that directly off the message.
 
 ### 7.9 Silo memory per-server
 

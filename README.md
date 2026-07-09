@@ -7,6 +7,7 @@ A Discord bot backed by a locally-hosted uncensored 24B model (Dolphin-Mistral-2
 - **Per-channel short-term transcript + mood** — the last N turns are replayed verbatim; mood tints the tone.
 - **Self-directed** — three independent tick loops decide, on their own timers, whether to speak up, chime in on an active channel, or react to something with an emoji. Nothing here is gated on you sending a new message.
 - **Consent-gated web search** (DuckDuckGo, no API key) — the bot asks before searching, never silently.
+- **Image understanding** (Qwen-VL via Ollama) — when a message carries image attachments, a separate vision model describes them and the description is folded into context, so the persona can respond to pictures without ever talking to the vision model directly.
 - **Prompt-injection defenses** — layered persona-level, sandwiched reminder, regex detection, optional LLM classifier, and send-time mention safety.
 - **Threads** — the model can open a Discord thread when a topic clearly deserves its own space.
 - **Message coalescing** — a burst of quick messages gets one thoughtful reply, not one-per-message.
@@ -42,6 +43,14 @@ ollama create khronic -f Modelfile
 ```
 
 Then set `MODEL_NAME=khronic` in your `.env`.
+
+**Optional: image understanding (vision).** Enabled by default (`VISION_ENABLED = True`). It uses a *separate* vision-capable model because Dolphin-Mistral is text-only. Pull one:
+
+```bash
+ollama pull qwen2.5vl:7b
+```
+
+The vision model is only ever invoked when an incoming message actually has image attachments, so text-only messages cost nothing extra. Its description is folded into the message text as plain context and the normal khronic persona handles the reply — the vision model never speaks to users. Override the model with `VISION_MODEL_NAME` in `.env`, or set `VISION_ENABLED = False` in `config.py` to turn the feature off entirely.
 
 ---
 
@@ -103,6 +112,9 @@ Optional: `cp examples.txt.example examples.txt` and paste in real conversation 
 
 **Current-info questions** (news, prices, weather, sports scores, etc.):
 - The bot proposes a web search first ("want me to look that up?"). It only actually searches on the next message if the user agrees.
+
+**Messages with images:**
+- If vision is enabled and the message has image attachments, a vision model describes them first and the description is folded into the message text before anything else runs. By default this also happens for images posted in channels the bot is only watching (`VISION_ANALYZE_PASSIVE`), so it can reference them later; set that to `False` to only analyze images in messages that directly address the bot.
 
 **In DMs:** it replies to every message. That's standard DM behavior.
 

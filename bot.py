@@ -12,6 +12,7 @@ import config
 import llm_client
 import web_search
 import guard
+import vision
 from memory import Memory
 from persona import (
     build_system_prompt,
@@ -689,8 +690,22 @@ async def on_message(message: discord.Message):
 
     is_dm = isinstance(message.channel, discord.DMChannel)
     text = strip_mention(message.content)
+    addressed = should_respond(message) or await is_conversation_followup(message)
 
-    if should_respond(message) or await is_conversation_followup(message):
+    # Vision is a cheap no-op for the vast majority of messages (no attachments -> no network
+    # or model call at all, see vision.describe_attachments). When a message does carry images,
+    # Qwen's description gets folded into the plain text right here, before anything else
+    # touches it -- so memory storage, generate_reply, follow-up detection on future turns,
+    # injection scanning, and summarization all just see it as more text and need no changes.
+    # VISION_ANALYZE_PASSIVE controls whether that also happens for images the bot wasn't
+    # addressed on (so it can still reference them later via attention/autonomy), vs. only
+    # ever spending a Qwen call on images in messages that directly address the bot.
+    if message.attachments and (addressed or config.VISION_ANALYZE_PASSIVE):
+        image_desc = await vision.describe_attachments(message.attachments)
+        if image_desc:
+            text = f"{text}\n{image_desc}" if text else image_desc
+
+    if addressed:
         # directly addressed (pinged, replied to, DM) or a natural follow-up to something
         # the bot just said -- respond in full
         if not text:
