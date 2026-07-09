@@ -158,7 +158,7 @@ def build_system_prompt(mood: str, profile_summary: str | None, channel_notes: s
     parts = [PERSONA_DESCRIPTION]
 
     now = datetime.now(ZoneInfo("America/Chicago"))
-    parts.append(f\"\\nCurrent date and time: {now.strftime('%A, %B %#d, %Y, %#I:%M %p')} Central Time.\")
+    parts.append(f"\nCurrent date and time: {now.strftime('%A, %B %#d, %Y, %#I:%M %p')} Central Time.")
     parts.append(f"\nYour current mood: {mood}. Let this color your tone without announcing it outright.")
 
     if profile_summary:
