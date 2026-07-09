@@ -2,6 +2,8 @@
 # "sentient" it feels -- specificity beats generic "you are a helpful assistant" every time.
 
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import config
 
@@ -155,6 +157,8 @@ def _strip_discord_chrome(line: str) -> str:
 def build_system_prompt(mood: str, profile_summary: str | None, channel_notes: str | None = None) -> str:
     parts = [PERSONA_DESCRIPTION]
 
+    now = datetime.now(ZoneInfo("America/Chicago"))
+    parts.append(f\"\\nCurrent date and time: {now.strftime('%A, %B %#d, %Y, %#I:%M %p')} Central Time.\")
     parts.append(f"\nYour current mood: {mood}. Let this color your tone without announcing it outright.")
 
     if profile_summary:
