@@ -6,7 +6,7 @@ Deeper walkthrough of how the bot is wired together. For install/setup, see [REA
 
 ## 1. What it is
 
-khronic is a Discord bot backed by a locally-hosted LLM (Dolphin-Mistral-24B-Venice-Edition via Ollama by default). Unlike a standard "assistant" bot it maintains a **persona**, a **per-user long-term memory profile**, a **per-channel short-term transcript**, a **mood** state, and **self-directed behavior** — three background loops decide on their own timers whether to react, chime in on an active channel, or say something after a long quiet. The goal is a Discord *participant* that feels continuous across time, not a request/response tool.
+khronic is a Discord bot backed by a locally-hosted LLM (Dolphin-Mistral-24B-Venice-Edition via Ollama by default). Unlike a standard "assistant" bot it maintains a **persona**, a **per-user long-term memory profile**, a **per-channel short-term transcript**, an **associative topic graph**, a continuously drifting **internal state**, and **self-directed behavior**. The goal is a Discord *participant* that feels continuous across time, not a request/response tool.
 
 Central design principle: **the bot's initiative is not gated on incoming messages.** Reactions and unprompted chime-ins are driven by ticks, not `on_message`. The only message-triggered paths are the ones that must be (`@mention` / reply / DM / name-triggered / conversation follow-up).
 
@@ -18,8 +18,10 @@ Central design principle: **the bot's initiative is not gated on incoming messag
 | --- | --- |
 | [bot.py](bot.py) | Discord event loop, response routing, background loops, coalescer. The "controller." |
 | [config.py](config.py) | Environment loading + all tunable knobs (probabilities, cooldowns, memory sizes, model name). Git-ignored — a `config.example.py` template ships in the repo. |
-| [persona.py](persona.py) | All prompt templates: main persona, `sandwich_messages`, summarization, mood, attention/follow-up decisions, web-search prompts, injection classifier. The "identity." |
-| [memory.py](memory.py) | `Memory` class — SQLite-backed persistence for messages, per-user profiles, and per-channel state (mood, last-summarized watermark, last message timestamp). |
+| [persona.py](persona.py) | All prompt templates: main persona, `sandwich_messages`, summarization, attention/follow-up decisions, web-search prompts, injection classifier. The "identity." |
+| [memory.py](memory.py) | `Memory` class — SQLite-backed persistence for messages, per-user profiles, and per-channel cursors/timestamps. |
+| [graph_memory.py](graph_memory.py) | Scope-isolated associative graph for users, channels, and topics, with long-term edge decay and short-term spreading activation. |
+| [mental_state.py](mental_state.py) | Persistent energy, valence, social battery, curiosity, hierarchical boredom, and autonomy/reaction urge calculations. |
 | [llm_client.py](llm_client.py) | Thin async wrapper around the Ollama `/api/chat` endpoint. `chat(messages, temperature=?, max_tokens=?, repeat_penalty=?, model=?) -> str`. The `model` override lets a single call target a different Ollama model (used by `vision.py`). |
 | [vision.py](vision.py) | Image understanding via a Qwen-VL model on Ollama. `describe_attachments(attachments)` filters image attachments, downloads them, and returns a compact factual description block to fold into the message text. A cheap no-op when there are no images. |
 | [web_search.py](web_search.py) | DuckDuckGo text search via the `ddgs` package. Runs off-loop with a hard timeout; returns `[]` on any failure so callers treat it as best-effort. |
@@ -57,7 +59,8 @@ flowchart TD
     HIST --> LLM
     LLM --> REACT[add_reaction]
 
-    AUT["autonomy_loop<br/>every 5 min"] --> MODE{idle vs active}
+    AUT["autonomy_loop<br/>every 5 min"] --> SCOPE["group by guild / DM<br/>choose one channel"]
+    SCOPE --> MODE{idle vs active urge}
     MODE -- idle --> LLM
     MODE -- active --> LLM
 
@@ -74,9 +77,11 @@ flowchart TD
 1. **Directly addressed** (`should_respond` in [bot.py](bot.py) — mention, reply-to-bot, DM, or name-triggered): the message is stored to memory immediately, then buffered for `COALESCE_WINDOW_SECONDS`. When the window closes, `_coalesced_reply` generates one reply from the accumulated context. `_check_injection` runs in parallel via `asyncio.create_task` so it never delays the reply.
 2. **Follow-up detection** (`is_conversation_followup`): if the bot has spoken recently in an active channel and someone sends an unaddressed message, a cheap recency gate fires and then an LLM call (`FOLLOWUP_DECISION_PROMPT`) makes the final YES/NO call on whether the message is actually continuing a conversation with the bot. Set `FOLLOWUP_USE_LLM = False` to fall back to a pure "did the bot send the last message" heuristic.
 3. **Attention loop** (`attention_loop`, every `ATTENTION_CHECK_INTERVAL_SECONDS`): per active channel per tick, fetches recent Discord history via `channel.history()`, filters out messages already considered (`_last_attention_msg_id` watermark) and bot messages, and asks the LLM `REACT <n> <emoji>` or `NONE`. If REACT, adds that emoji to that specific message.
-4. **Autonomy loop** (`autonomy_loop`, every `AUTONOMY_CHECK_INTERVAL_MINUTES`) — two modes per channel per tick:
-   - **Idle mode**: channel quiet for ≥ `AUTONOMY_MIN_IDLE_MINUTES`. Roll `AUTONOMY_CHANCE`. This is the "haven't heard from you in a while" nudge.
-   - **Active mode**: channel active within `AUTONOMY_ACTIVE_MAX_IDLE_MINUTES`, bot hasn't self-chimed here in `AUTONOMY_ACTIVE_MIN_SINCE_LAST_BOT_MINUTES`. Roll `AUTONOMY_ACTIVE_CHANCE`. This is the "just felt like saying something" chime-in that isn't wired to any specific incoming message. Skips DMs (they already always get replies).
+4. **Autonomy loop** (`autonomy_loop`, every `AUTONOMY_CHECK_INTERVAL_MINUTES`) — groups eligible channels by boredom scope before deciding:
+    - Every guild is one scope; every DM channel is its own scope. Activity in one guild never changes another guild or DM.
+    - **Idle mode** considers channels quiet for at least `AUTONOMY_MIN_IDLE_MINUTES`; channel-level silence chooses one destination inside the scope.
+    - **Active mode** prefers the most recently active eligible channel and uses `AUTONOMY_ACTIVE_URGE_THRESHOLD`.
+    - At most one message is sent per scope, a successful send resets scope boredom, and `AUTONOMY_MAX_SENDS_PER_TICK` limits global bursts.
 
 Both autonomy modes get an `AUTONOMY_PROMPT_SUFFIX` that gives the model an explicit `[SKIP]` escape hatch. Direct replies also honor `[SKIP]` — the persona allows it rarely.
 
@@ -121,9 +126,11 @@ Storing row ids alongside messages is what lets the thread path move the trigger
 - **Short-term (verbatim)**: last `SHORT_TERM_TURNS` (default 20) messages per channel, replayed into every prompt as-is with the speaker's name prefixed so the model can distinguish multiple users.
 - **Long-term (summarized)**: every `SUMMARIZE_EVERY` (default 30) new messages, `maybe_summarize` sends the batch plus the current profile to the LLM with `SUMMARIZATION_SYSTEM_PROMPT` and replaces the profile with a fresh 3–6 bullet summary. This is what gives the bot cross-conversation "continuity."
 
-### Mood
+### Associative graph and internal state
 
-Short free-text phrase (e.g. `"curious and a bit playful"`) stored per-channel. Updated in the *same* summarization pass via `MOOD_SYSTEM_PROMPT` and injected into the system prompt on future turns. Currently **per-channel** and **replace-on-update** — no decay, no per-turn nudging, no cross-channel blending. Easy upgrade if you want it.
+Every incoming message nudges energy, valence, social battery, and curiosity and records scope-namespaced user/topic/channel nodes in `AssociativeGraph`. Edge weight represents long-term association; activation represents short-term salience. Both decay over time.
+
+Boredom is timestamp-derived and hierarchical. Scope-level silence decides whether the bot wants to speak; channel-level silence chooses where inside that scope. Persisted clocks restart at boot so offline time cannot create a reconnect burst. The state maintenance loop ticks every `MENTAL_TICK_INTERVAL_SECONDS`, saves periodically, and compacts the graph daily.
 
 ### Caveats
 
@@ -135,11 +142,11 @@ Short free-text phrase (e.g. `"curious and a bit playful"`) stored per-channel. 
 
 ## 5. Prompt construction
 
-Every persona-driven LLM call is built from `build_system_prompt(mood, profile_summary, channel_notes=None)` in [persona.py](persona.py):
+Every persona-driven LLM call is built from `build_system_prompt(mood, profile_summary, channel_notes=None, mental_state_fragment=None)` in [persona.py](persona.py). Runtime calls use `mental_state_fragment` and leave the legacy mood argument empty:
 
 ```
 PERSONA_DESCRIPTION
-+ current mood
++ current internal-state description
 + (per-user profile summary, or a "no prior memory" note)
 + (optional channel notes — currently never passed)
 + formatting rules ("respond with ONLY your in-character message, concise")
@@ -158,15 +165,14 @@ Path-specific suffixes/overrides layered on top:
 | --- | --- |
 | Direct reply (`generate_reply`) | Just `build_system_prompt` + short-term transcript + latest user turn (+ web results block if the user approved a search). |
 | Idle / active autonomy (`autonomy_loop`) | `build_system_prompt` + `AUTONOMY_PROMPT_SUFFIX` (explicit `[SKIP]` for "nothing feels natural"). |
-| Attention reaction (`attention_loop`) | `ATTENTION_DECISION_PROMPT` + mood, with a numbered list of recent messages. Returns `REACT <n> <emoji>` or `NONE`. Does **not** use `build_system_prompt` — it's a narrow decision call. |
+| Attention reaction (`attention_loop`) | `ATTENTION_DECISION_PROMPT` + internal-state fragment, with a numbered list of recent messages. Returns `REACT <n> <emoji>` or `NONE`. |
 | Follow-up decision (`llm_followup_decision`) | `FOLLOWUP_DECISION_PROMPT` only. YES/NO. |
 | Web-query gate (`_build_search_query`) | `WEB_QUERY_PROMPT`. Returns a concise search query or `NO_SEARCH`. |
 | Search-consent judge (`_is_affirmative`) | `SEARCH_CONSENT_PROMPT`. YES/NO. |
 | Injection classifier (`guard.is_injection_attempt_llm`) | `INJECTION_CLASSIFIER_PROMPT`. YES/NO. |
 | Summarization (`maybe_summarize`) | `SUMMARIZATION_SYSTEM_PROMPT` only — does **not** use the persona. |
-| Mood update (`maybe_summarize`) | `MOOD_SYSTEM_PROMPT` only. |
 
-**Design principle**: the persona is only injected when the bot is *speaking as itself*. Utility calls (summarize, mood, YES/NO decisions, search gates) use narrow task-specific prompts so the persona doesn't leak into internal reasoning, and they don't get sandwiched.
+**Design principle**: the persona is only injected when the bot is *speaking as itself*. Utility calls (summarize, YES/NO decisions, search gates) use narrow task-specific prompts so the persona doesn't leak into internal reasoning, and they don't get sandwiched.
 
 ---
 
@@ -193,14 +199,23 @@ All in [config.py](config.py). Env vars override defaults via `.env` (loaded by 
 - `AUTONOMY_ENABLED` (True)
 - `AUTONOMY_CHECK_INTERVAL_MINUTES` (5) — poll cadence for both idle and active modes.
 - `AUTONOMY_MIN_IDLE_MINUTES` (120) — channel must be quiet this long before idle mode is eligible.
-- `AUTONOMY_CHANCE` (0.35) — coin-flip once eligible.
+- `AUTONOMY_IDLE_URGE_THRESHOLD` (0.55) — minimum state-derived urge for an idle scope.
 - `AUTONOMY_CHANNEL_WHITELIST` (`[]`) — empty means "any channel the bot has spoken in." Applies to **both** loops.
+- `AUTONOMY_SCOPE_COOLDOWN_MINUTES` (15) — successful autonomous speech settles the whole guild or DM scope.
+- `AUTONOMY_MAX_SENDS_PER_TICK` (1) — global burst guard across independent scopes.
 
 ### Active-channel autonomy
 - `AUTONOMY_ACTIVE_ENABLED` (True)
-- `AUTONOMY_ACTIVE_CHANCE` (0.13) — per-tick per-eligible-channel probability.
+- `AUTONOMY_ACTIVE_URGE_THRESHOLD` (0.55) — minimum state-derived urge for joining active conversation.
 - `AUTONOMY_ACTIVE_MIN_SINCE_LAST_BOT_MINUTES` (15) — skip if the bot self-chimed here recently. This is what stops self-looping.
 - `AUTONOMY_ACTIVE_MAX_IDLE_MINUTES` (30) — channel must have activity within this window.
+
+### Internal state and graph
+- `MENTAL_BOREDOM_RATE` (0.00002) — boredom gained per second of scope silence.
+- `MENTAL_STARTUP_GRACE_SECONDS` (300) — reconnect circuit breaker for unprompted speech.
+- `MENTAL_TICK_INTERVAL_SECONDS` (30) — affective-state update cadence.
+- `STATE_SAVE_INTERVAL_SECONDS` (300) — asynchronous persistence cadence.
+- `GRAPH_COMPACT_INTERVAL_SECONDS` (86400) — graph prune/full-save cadence.
 
 ### Attention loop (reactions)
 - `ATTENTION_ENABLED` (True)
@@ -260,8 +275,8 @@ The bot uses `commands.Bot(command_prefix="!khronic ")` and calls `await bot.pro
 ```python
 @bot.command(name="mood")
 async def show_mood(ctx: commands.Context):
-    state = await mem.get_channel_state(ctx.channel.id)
-    await ctx.send(f"current mood: {state['mood']}")
+    scope_id = _scope_id(ctx.channel)
+    await ctx.send(mental_state.render_prompt_fragment(ctx.channel.id, scope_id))
 ```
 
 For proper slash commands add `bot.tree.command(...)` and call `await bot.tree.sync()` in `on_ready`.
@@ -280,7 +295,7 @@ If you're adding a new *kind* of LLM call (not a persona rewrite), put the promp
 
 Two options:
 
-**Extend `autonomy_loop`** — best when the new behavior is "post a message when X." Add a new mode alongside idle/active with its own eligibility gate and chance, mirroring the pattern in the existing function.
+**Extend `autonomy_loop`** — best when the new behavior is "post a message when X." Keep grouping and destination selection scope-aware, then add a mode-specific eligibility gate and urge threshold.
 
 **New tick loop** — best when the behavior has a different cadence or needs Discord API data the DB doesn't have (like `attention_loop` needing actual `Message` objects to react to). Copy the shape of `attention_loop`:
 
@@ -334,8 +349,8 @@ Be careful: an uncensored 24B model with arbitrary tool access is a much bigger 
 - To inspect what the bot "remembers," open `sentient_bot.db` in any SQLite browser. You can hand-edit a profile if a summary drifts weird — the code always reads fresh on each turn.
 - Increase log verbosity by changing `logging.basicConfig(level=logging.INFO)` at the top of [bot.py](bot.py) to `DEBUG`. All autonomy paths already log when they fire and when they skip.
 - To exercise autonomy quickly during dev:
-  - **Idle**: temporarily set `AUTONOMY_CHECK_INTERVAL_MINUTES = 1`, `AUTONOMY_MIN_IDLE_MINUTES = 1`, `AUTONOMY_CHANCE = 1.0`.
-  - **Active**: set `AUTONOMY_ACTIVE_CHANCE = 1.0`, `AUTONOMY_ACTIVE_MIN_SINCE_LAST_BOT_MINUTES = 0`.
+    - **Idle**: temporarily set `AUTONOMY_CHECK_INTERVAL_MINUTES = 1`, `AUTONOMY_MIN_IDLE_MINUTES = 1`, and `AUTONOMY_IDLE_URGE_THRESHOLD = 0.0`.
+    - **Active**: set `AUTONOMY_ACTIVE_URGE_THRESHOLD = 0.0` and `AUTONOMY_ACTIVE_MIN_SINCE_LAST_BOT_MINUTES = 0`.
   - **Attention**: set `ATTENTION_CHECK_INTERVAL_SECONDS = 15`, `ATTENTION_CHANCE = 1.0`.
 - To exercise coalescing, drop `COALESCE_WINDOW_SECONDS` to a smaller number or push it up to see the buffer fill.
 - `examples.txt` is re-read on every reply, so you can tune voice without restarting the bot.
@@ -364,7 +379,7 @@ Two constants in [persona.py](persona.py) do the heavy lifting:
 - `INJECTION_GUARD` — appended **last** in `build_system_prompt` (models weight recent context more heavily). Written in-character: the goal is "don't take the bait, stay khronic," not "refuse and lecture." A visible refusal breaks the persona more than just ignoring the attempt. Deliberately narrow — an explicit carve-out says that ordinary requests, jokes, weird topics, and provocations are NOT attacks.
 - `INJECTION_REMINDER_SHORT` + `sandwich_messages(messages)` — inserts a short reminder as a system-role message **immediately before the final user turn**. Called from every persona-driven code path: `generate_reply`, `autonomy_loop`.
 
-Utility calls (summarizer, mood, attention decision, follow-up decision, web-query gate, search-consent judge, injection classifier) don't get sandwiched — they use narrow task-specific prompts and shouldn't inherit the persona.
+Utility calls (summarizer, attention decision, follow-up decision, web-query gate, search-consent judge, injection classifier) don't get sandwiched — they use narrow task-specific prompts and shouldn't inherit the persona.
 
 ### 10.2 Detection layer ([guard.py](guard.py))
 

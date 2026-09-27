@@ -14,12 +14,13 @@ import web_search
 import guard
 import vision
 from memory import Memory
+from graph_memory import AssociativeGraph
+from mental_state import MentalState
 from persona import (
     build_system_prompt,
     sandwich_messages,
     AUTONOMY_PROMPT_SUFFIX,
     SUMMARIZATION_SYSTEM_PROMPT,
-    MOOD_SYSTEM_PROMPT,
     ATTENTION_DECISION_PROMPT,
     FOLLOWUP_DECISION_PROMPT,
     WEB_QUERY_PROMPT,
@@ -41,12 +42,22 @@ bot = commands.Bot(
     allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
 )
 mem = Memory()
+graph = AssociativeGraph(config.DB_PATH)
+mental_state = MentalState(
+    config.DB_PATH,
+    seed_traits={
+        "boredom_rate": getattr(config, "MENTAL_BOREDOM_RATE", 0.00002),
+        "startup_grace_s": getattr(config, "MENTAL_STARTUP_GRACE_SECONDS", 300),
+    },
+    graph=graph,
+)
 
 # in-memory cooldown trackers (ephemeral -- reset on restart, that's fine for this purpose)
 _last_thread_ts: dict[int, float] = {}
 # tracks the last time the autonomy loop *itself* posted in a channel, so the active-channel
 # tick can throttle self-initiated chime-ins independently of normal-reply cadence.
 _last_autonomous_ts: dict[int, float] = {}
+_last_autonomous_scope_ts: dict[str, float] = {}
 # attention_loop watermark: highest Discord message id already "seen" per channel, so the
 # LLM only ever considers new messages for reactions.
 _last_attention_msg_id: dict[int, int] = {}
@@ -61,6 +72,9 @@ _channel_locks: dict[int, asyncio.Lock] = {}
 # can be moved into the thread's context instead of dangling in the parent channel.
 _pending_msgs: dict[int, list[tuple[discord.Message, int]]] = {}
 _debounce_tasks: dict[int, asyncio.Task] = {}
+_state_save_lock = asyncio.Lock()
+_last_state_save_ts = 0.0
+_last_graph_compaction_ts = 0.0
 
 
 def _channel_lock(channel_id: int) -> asyncio.Lock:
@@ -69,6 +83,22 @@ def _channel_lock(channel_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _channel_locks[channel_id] = lock
     return lock
+
+
+def _scope_id(channel: discord.abc.Messageable) -> str:
+    """Return the independent boredom/memory scope for a guild channel or DM."""
+    guild_id = getattr(getattr(channel, "guild", None), "id", None)
+    if guild_id is not None:
+        return f"guild:{guild_id}"
+    return f"dm:{getattr(channel, 'id', 0)}"
+
+
+async def _save_internal_state(full_graph: bool = False) -> None:
+    async with _state_save_lock:
+        await asyncio.gather(
+            mental_state.save_async(),
+            graph.save_async(full=full_graph),
+        )
 
 
 async def _check_injection(text: str, message: discord.Message) -> None:
@@ -515,7 +545,7 @@ async def resolve_web_lookup(channel_id: int, latest_user_msg: str | None) -> tu
     return ("ask", None)
 
 
-async def generate_reply(channel_id: int, profile_user_id: int | None) -> str:
+async def generate_reply(channel_id: int, profile_user_id: int | None, scope_id: str) -> str:
     """Generate a reply from the channel's stored recent context.
 
     Callers store the incoming message(s) to memory first, so the latest turns are already in
@@ -526,7 +556,11 @@ async def generate_reply(channel_id: int, profile_user_id: int | None) -> str:
     profile = await mem.get_profile(profile_user_id) if profile_user_id else None
     recent = await mem.get_recent_messages(channel_id, config.SHORT_TERM_TURNS)
 
-    system_prompt = build_system_prompt(mood=state["mood"], profile_summary=profile)
+    system_prompt = build_system_prompt(
+        mood=None,
+        profile_summary=profile,
+        mental_state_fragment=mental_state.render_prompt_fragment(channel_id, scope_id),
+    )
 
     # consent-gated web lookup: propose a search and wait for approval before ever hitting the
     # network. "ask" -> return the permission question as the whole reply; "context" -> the user
@@ -585,18 +619,6 @@ async def maybe_summarize(channel_id: int, user_id: int, username: str):
     except Exception as e:
         log.warning(f"Summarization failed: {e}")
 
-    # lightweight mood update off the same transcript
-    try:
-        mood_messages = [
-            {"role": "system", "content": MOOD_SYSTEM_PROMPT},
-            {"role": "user", "content": transcript},
-        ]
-        mood = await llm_client.chat(mood_messages, temperature=0.5, max_tokens=20)
-        await mem.set_mood(channel_id, mood)
-    except Exception as e:
-        log.warning(f"Mood update failed: {e}")
-
-
 @bot.event
 async def setup_hook():
     # setup_hook runs after login but BEFORE the gateway starts dispatching events, so any
@@ -604,15 +626,53 @@ async def setup_hook():
     # instead races: on_ready runs concurrently with early message events, and get_channel_state
     # would blow up with 'NoneType has no attribute execute' if a message beat the init await.
     await mem.init()
+    await asyncio.gather(
+        asyncio.to_thread(graph.load),
+        asyncio.to_thread(mental_state.load),
+    )
 
 
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user}")
+    if not state_maintenance_loop.is_running():
+        state_maintenance_loop.start()
     if config.AUTONOMY_ENABLED and not autonomy_loop.is_running():
         autonomy_loop.start()
     if config.ATTENTION_ENABLED and not attention_loop.is_running():
         attention_loop.start()
+
+
+@bot.event
+async def on_disconnect():
+    try:
+        await _save_internal_state()
+    except Exception as e:
+        log.warning(f"State save on disconnect failed: {e}")
+
+
+@tasks.loop(seconds=getattr(config, "MENTAL_TICK_INTERVAL_SECONDS", 30))
+async def state_maintenance_loop():
+    global _last_state_save_ts, _last_graph_compaction_ts
+
+    mental_state.tick()
+    now = time.time()
+    save_interval = getattr(config, "STATE_SAVE_INTERVAL_SECONDS", 300)
+    compact_interval = getattr(config, "GRAPH_COMPACT_INTERVAL_SECONDS", 86400)
+    full_graph = now - _last_graph_compaction_ts >= compact_interval
+    if now - _last_state_save_ts < save_interval and not full_graph:
+        return
+    if full_graph:
+        graph.prune()
+    await _save_internal_state(full_graph=full_graph)
+    _last_state_save_ts = now
+    if full_graph:
+        _last_graph_compaction_ts = now
+
+
+@state_maintenance_loop.before_loop
+async def before_state_maintenance():
+    await bot.wait_until_ready()
 
 
 async def _coalesced_reply(channel_id: int):
@@ -641,7 +701,11 @@ async def _coalesced_reply(channel_id: int):
             channel = anchor.channel
             async with channel.typing():
                 try:
-                    reply = await generate_reply(channel_id, anchor.author.id)
+                    reply = await generate_reply(
+                        channel_id,
+                        anchor.author.id,
+                        scope_id=_scope_id(channel),
+                    )
                 except Exception:
                     log.exception("Generation failed")
                     await channel.send("(brain fog -- something broke on my end, try again in a sec)")
@@ -669,9 +733,11 @@ async def _coalesced_reply(channel_id: int):
                             log.warning(f"Couldn't create thread '{thread_name}': {e}")
                             target = channel
 
-                    await mem.add_message(getattr(target, "id", channel_id), bot.user.id,
-                                           str(bot.user), "assistant", reply)
-                    await send_message(target, reply, guild=anchor.guild)
+                    sent = await send_message(target, reply, guild=anchor.guild)
+                    if sent:
+                        target_id = getattr(target, "id", channel_id)
+                        await mem.add_message(target_id, bot.user.id, str(bot.user), "assistant", reply)
+                        mental_state.on_bot_spoke(target_id, _scope_id(target))
 
             asyncio.create_task(
                 maybe_summarize(channel_id, anchor.author.id, anchor.author.display_name)
@@ -705,6 +771,13 @@ async def on_message(message: discord.Message):
         if image_desc:
             text = f"{text}\n{image_desc}" if text else image_desc
 
+    mental_state.on_message(
+        channel_id=message.channel.id,
+        scope_id=_scope_id(message.channel),
+        user_id=message.author.id,
+        text=text or None,
+    )
+
     if addressed:
         # directly addressed (pinged, replied to, DM) or a natural follow-up to something
         # the bot just said -- respond in full
@@ -737,24 +810,17 @@ async def on_message(message: discord.Message):
 
 @tasks.loop(minutes=config.AUTONOMY_CHECK_INTERVAL_MINUTES)
 async def autonomy_loop():
-    """Self-initiated behavior: on every tick, consider each channel the bot knows about and
-    decide whether to speak up on its own -- independent of any user message triggering it.
-
-    Two modes, per channel:
-      - IDLE: the channel has been quiet for a long time (AUTONOMY_MIN_IDLE_MINUTES). Roll
-        AUTONOMY_CHANCE. This is the "haven't heard from you all in a while" nudge.
-      - ACTIVE: the channel has fresh activity (within AUTONOMY_ACTIVE_MAX_IDLE_MINUTES) but
-        the bot hasn't chimed in autonomously here recently. Roll AUTONOMY_ACTIVE_CHANCE.
-        This is the "just felt like saying something" chime-in that isn't wired to any
-        specific incoming message.
-
-    Either way the LLM gets the [SKIP] escape hatch (via AUTONOMY_PROMPT_SUFFIX and the
-    formatting instruction added in build_system_prompt), so the model still has final veto.
-    """
+    """Choose at most one destination per guild or independent DM boredom scope."""
     channels = await mem.all_known_channels()
     now = time.time()
+    candidates_by_scope: dict[str, list[tuple[str, float, int, discord.abc.Messageable]]] = {}
+
     for channel_id in channels:
         if config.AUTONOMY_CHANNEL_WHITELIST and channel_id not in config.AUTONOMY_CHANNEL_WHITELIST:
+            continue
+
+        channel = bot.get_channel(channel_id)
+        if channel is None or not _channel_allowed(channel):
             continue
 
         state = await mem.get_channel_state(channel_id)
@@ -763,55 +829,103 @@ async def autonomy_loop():
             continue
         idle_minutes = (now - last_ts) / 60
 
-        channel = bot.get_channel(channel_id)
-        if channel is None:
-            continue
-
-        # -- decide which mode (if any) this channel is eligible for --
-        mode: str | None = None
         if idle_minutes >= config.AUTONOMY_MIN_IDLE_MINUTES:
-            if random.random() <= config.AUTONOMY_CHANCE:
-                mode = "idle"
+            mode = "idle"
         elif (
             config.AUTONOMY_ACTIVE_ENABLED
-            and not isinstance(channel, discord.DMChannel)  # DMs already always get replies
+            and not isinstance(channel, discord.DMChannel)
             and idle_minutes <= config.AUTONOMY_ACTIVE_MAX_IDLE_MINUTES
         ):
             last_self = _last_autonomous_ts.get(channel_id, 0)
             gap_minutes = (now - last_self) / 60
-            if gap_minutes >= config.AUTONOMY_ACTIVE_MIN_SINCE_LAST_BOT_MINUTES:
-                if random.random() <= config.AUTONOMY_ACTIVE_CHANCE:
-                    mode = "active"
-        if mode is None:
+            if gap_minutes < config.AUTONOMY_ACTIVE_MIN_SINCE_LAST_BOT_MINUTES:
+                continue
+            mode = "active"
+        else:
             continue
 
-        recent = await mem.get_recent_messages(channel_id, config.SHORT_TERM_TURNS)
-        if not recent:
+        scope_id = _scope_id(channel)
+        scope_gap_minutes = (now - _last_autonomous_scope_ts.get(scope_id, 0)) / 60
+        scope_cooldown = getattr(
+            config,
+            "AUTONOMY_SCOPE_COOLDOWN_MINUTES",
+            config.AUTONOMY_ACTIVE_MIN_SINCE_LAST_BOT_MINUTES,
+        )
+        if scope_gap_minutes < scope_cooldown:
+            continue
+        candidates_by_scope.setdefault(scope_id, []).append(
+            (mode, idle_minutes, channel_id, channel)
+        )
+
+    sent_count = 0
+    max_sends = getattr(config, "AUTONOMY_MAX_SENDS_PER_TICK", 1)
+    for scope_id, scope_candidates in candidates_by_scope.items():
+        if sent_count >= max_sends:
+            break
+
+        active = [candidate for candidate in scope_candidates if candidate[0] == "active"]
+        if active:
+            mode, idle_minutes, channel_id, channel = min(active, key=lambda item: item[1])
+        else:
+            mode, idle_minutes, channel_id, channel = max(
+                scope_candidates,
+                key=lambda item: mental_state.channel_boredom(item[2]),
+            )
+
+        threshold = getattr(
+            config,
+            "AUTONOMY_ACTIVE_URGE_THRESHOLD" if mode == "active" else "AUTONOMY_IDLE_URGE_THRESHOLD",
+            0.55,
+        )
+        urge = mental_state.speak_urge(channel_id, scope_id)
+        if not mental_state.should_speak_unprompted(channel_id, scope_id, threshold=threshold):
+            log.debug(
+                f"Autonomy urge below threshold ({mode}) in scope {scope_id}: "
+                f"{urge:.2f} < {threshold:.2f}"
+            )
             continue
 
-        system_prompt = build_system_prompt(mood=state["mood"], profile_summary=None) + AUTONOMY_PROMPT_SUFFIX
-        messages = [{"role": "system", "content": system_prompt}]
-        for role, content, uname in recent:
-            if role == "user" and uname:
-                messages.append({"role": "user", "content": f"{uname}: {content}"})
-            else:
-                messages.append({"role": role, "content": content})
-        messages = sandwich_messages(messages)
+        async with _channel_lock(channel_id):
+            recent = await mem.get_recent_messages(channel_id, config.SHORT_TERM_TURNS)
+            if not recent:
+                continue
 
-        try:
-            reply = await llm_client.chat(messages)
-        except Exception as e:
-            log.warning(f"Autonomy generation failed: {e}")
-            continue
+            system_prompt = build_system_prompt(
+                mood=None,
+                profile_summary=None,
+                mental_state_fragment=mental_state.render_prompt_fragment(channel_id, scope_id),
+            ) + AUTONOMY_PROMPT_SUFFIX
+            messages = [{"role": "system", "content": system_prompt}]
+            for role, content, uname in recent:
+                if role == "user" and uname:
+                    messages.append({"role": "user", "content": f"{uname}: {content}"})
+                else:
+                    messages.append({"role": role, "content": content})
+            messages = sandwich_messages(messages)
 
-        if reply.strip() == "[SKIP]" or not reply.strip():
-            log.info(f"Autonomy skipped ({mode}) in channel {channel_id}")
-            continue
+            try:
+                reply = await llm_client.chat(messages)
+            except Exception as e:
+                log.warning(f"Autonomy generation failed: {e}")
+                continue
 
-        await mem.add_message(channel_id, bot.user.id, str(bot.user), "assistant", reply)
-        await send_message(channel, reply, guild=getattr(channel, "guild", None))
-        _last_autonomous_ts[channel_id] = time.time()
-        log.info(f"Sent autonomous message ({mode}) in channel {channel_id}")
+            if reply.strip().upper() == "[SKIP]" or not reply.strip():
+                log.info(f"Autonomy skipped ({mode}) in channel {channel_id}")
+                continue
+
+            sent = await send_message(channel, reply, guild=getattr(channel, "guild", None))
+            if not sent:
+                continue
+            await mem.add_message(channel_id, bot.user.id, str(bot.user), "assistant", reply)
+            mental_state.on_bot_spoke(channel_id, scope_id, unprompted=True)
+            sent_at = time.time()
+            _last_autonomous_ts[channel_id] = sent_at
+            _last_autonomous_scope_ts[scope_id] = sent_at
+            sent_count += 1
+            log.info(
+                f"Sent autonomous message ({mode}) in channel {channel_id} "
+                f"for scope {scope_id} at urge {urge:.2f}"
+            )
 
 
 @autonomy_loop.before_loop
@@ -855,7 +969,8 @@ async def attention_loop():
         if channel is None or isinstance(channel, discord.DMChannel):
             continue
 
-        if random.random() > config.ATTENTION_CHANCE:
+        attention_chance = min(1.0, config.ATTENTION_CHANCE * (0.5 + mental_state.react_urge()))
+        if random.random() > attention_chance:
             continue
 
         # Pull recent messages from Discord itself (not memory) so we can react to the actual
@@ -883,8 +998,15 @@ async def attention_loop():
             f"[{i + 1}] {m.author.display_name}: {m.content}"
             for i, m in enumerate(candidates)
         )
+        scope_id = _scope_id(channel)
         prompt_messages = [
-            {"role": "system", "content": f"{ATTENTION_DECISION_PROMPT}\n\nYour current mood: {state['mood']}"},
+            {
+                "role": "system",
+                "content": (
+                    f"{ATTENTION_DECISION_PROMPT}\n\n"
+                    f"{mental_state.render_prompt_fragment(channel_id, scope_id)}"
+                ),
+            },
             {"role": "user", "content": f"Recent messages:\n{numbered}"},
         ]
         try:

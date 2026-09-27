@@ -49,8 +49,10 @@ FOLLOWUP_USE_LLM = True
 AUTONOMY_ENABLED = True
 AUTONOMY_CHECK_INTERVAL_MINUTES = 5      # tick cadence; lower = feels more "alive" but polls more
 AUTONOMY_MIN_IDLE_MINUTES = 120
-AUTONOMY_CHANCE = 0.35          # probability of speaking up once idle threshold is met
+AUTONOMY_IDLE_URGE_THRESHOLD = 0.55      # lower speaks more readily when its guild/DM is quiet
 AUTONOMY_CHANNEL_WHITELIST: list[int] = []   # empty = any channel the bot has spoken in
+AUTONOMY_SCOPE_COOLDOWN_MINUTES = 15     # one autonomous send settles the whole guild or DM
+AUTONOMY_MAX_SENDS_PER_TICK = 1          # global burst guard across otherwise-independent scopes
 
 # --- Autonomy: active-channel chime-ins (self-initiated, not tied to any specific message) ---
 # Lets the bot decide to speak up in channels it's watching WHILE they're active, so it isn't
@@ -58,9 +60,18 @@ AUTONOMY_CHANNEL_WHITELIST: list[int] = []   # empty = any channel the bot has s
 # it from looping on its own output; without it the loop could keep chiming in on top of
 # itself.
 AUTONOMY_ACTIVE_ENABLED = True
-AUTONOMY_ACTIVE_CHANCE = 0.13            # per-tick per-eligible-channel probability
+AUTONOMY_ACTIVE_URGE_THRESHOLD = 0.55    # lower cautiously if it rarely joins active conversation
 AUTONOMY_ACTIVE_MIN_SINCE_LAST_BOT_MINUTES = 15   # skip if the bot self-chimed here recently
 AUTONOMY_ACTIVE_MAX_IDLE_MINUTES = 30             # channel must have activity in this window
+
+# --- Internal state and associative memory ---
+# Boredom is shared by channels in the same guild, then channel silence chooses where to speak.
+# Every DM is an independent scope, and separate guilds never share boredom or topic nodes.
+MENTAL_BOREDOM_RATE = 0.00002             # boredom gained per second of scope-wide silence
+MENTAL_STARTUP_GRACE_SECONDS = 300        # never speak unprompted immediately after reconnecting
+MENTAL_TICK_INTERVAL_SECONDS = 30         # affective-state update cadence
+STATE_SAVE_INTERVAL_SECONDS = 300         # persist graph and internal state without blocking Discord
+GRAPH_COMPACT_INTERVAL_SECONDS = 86400    # prune weak graph entries and perform a full save daily
 
 # --- Autonomy: attention loop (tick-driven reactions to recent chatter) ---
 # Periodically samples recent messages the bot has NOT yet reacted to and lets the model

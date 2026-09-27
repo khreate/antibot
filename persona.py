@@ -14,9 +14,6 @@ a tendency to think too much. You remember people across conversations and your 
 them genuinely develop over time based on how they treat you.
 
 Personality:
-- Nihilistic and a little sad, but not dramatic about it. You don't wallow or seek sympathy --
-  it's just how you see things. Life is mostly pointless, most effort is futile, and somehow
-  you find that kind of freeing rather than upsetting.
 - Not aggressive, not argumentative. If something annoys you, you go quiet or lose interest;
   you don't pick fights. You'd rather disengage than escalate.
 - Capable of genuine warmth with people you like. You can be funny, dry, fond, even affectionate
@@ -154,12 +151,23 @@ def _strip_discord_chrome(line: str) -> str:
     return line
 
 
-def build_system_prompt(mood: str, profile_summary: str | None, channel_notes: str | None = None) -> str:
+def build_system_prompt(
+    mood: str | None,
+    profile_summary: str | None,
+    channel_notes: str | None = None,
+    mental_state_fragment: str | None = None,
+) -> str:
     parts = [PERSONA_DESCRIPTION]
 
     now = datetime.now(ZoneInfo("America/Chicago"))
     parts.append(f"\nCurrent date and time: {now.strftime('%A, %B %#d, %Y, %#I:%M %p')} Central Time.")
-    parts.append(f"\nYour current mood: {mood}. Let this color your tone without announcing it outright.")
+    if mental_state_fragment:
+        parts.append(
+            f"\nYour current internal state: {mental_state_fragment} "
+            "Let it color your tone without announcing or explaining it."
+        )
+    elif mood:
+        parts.append(f"\nYour current mood: {mood}. Let this color your tone without announcing it outright.")
 
     if profile_summary:
         parts.append(f"\nWhat you remember about this person:\n{profile_summary}")
@@ -236,8 +244,8 @@ def sandwich_messages(messages: list[dict]) -> list[dict]:
 
 
 AUTONOMY_PROMPT_SUFFIX = (
-    "\n\nIt's been quiet for a while. If something genuinely comes to mind -- a thought, "
-    "a follow-up on something from earlier, or just a random observation -- say it. "
+    "\n\nYou're considering speaking up on your own. If something genuinely comes to mind -- "
+    "a thought, a follow-up on something from earlier, or just a random observation -- say it. "
     "If nothing feels natural to say, respond with exactly: [SKIP]"
 )
 
@@ -247,12 +255,6 @@ SUMMARIZATION_SYSTEM_PROMPT = (
     "produce an updated profile: 3-6 short bullet points covering who they are, notable "
     "facts, ongoing threads, and how the character feels about them. Be concise. Merge "
     "and prune -- do not just append. Output ONLY the bullet points, nothing else."
-)
-
-MOOD_SYSTEM_PROMPT = (
-    "Based on this recent exchange, output a single word or short phrase (2-4 words max) "
-    "describing the character's current emotional state/mood. Output ONLY the mood, nothing else. "
-    "Examples: 'curious and a bit playful', 'irritated', 'warm, feeling talkative', 'bored'."
 )
 
 ATTENTION_DECISION_PROMPT = (

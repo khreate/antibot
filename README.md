@@ -4,8 +4,8 @@ A Discord bot backed by a locally-hosted uncensored 24B model (Dolphin-Mistral-2
 
 - **Persona-first prompt** (`persona.py`) — the model plays a specific character, not "a helpful AI."
 - **Per-user long-term memory** — SQLite-backed profiles built by periodic LLM summarization. Nothing leaves your machine.
-- **Per-channel short-term transcript + mood** — the last N turns are replayed verbatim; mood tints the tone.
-- **Self-directed** — three independent tick loops decide, on their own timers, whether to speak up, chime in on an active channel, or react to something with an emoji. Nothing here is gated on you sending a new message.
+- **Layered memory and internal state** — recent transcripts, per-user summaries, a decaying associative topic graph, and continuously drifting energy, valence, curiosity, and social battery.
+- **Self-directed** — background loops use that internal state to decide whether to speak up or react. Nothing here is gated on you sending a new message.
 - **Consent-gated web search** (DuckDuckGo, no API key) — the bot asks before searching, never silently.
 - **Image understanding** (Qwen-VL via Ollama) — when a message carries image attachments, a separate vision model describes them and the description is folded into context, so the persona can respond to pictures without ever talking to the vision model directly.
 - **Prompt-injection defenses** — layered persona-level, sandwiched reminder, regex detection, optional LLM classifier, and send-time mention safety.
@@ -107,8 +107,10 @@ Optional: `cp examples.txt.example examples.txt` and paste in real conversation 
 **Not addressed at all:**
 - The message is logged to memory for context, but no reply is generated from the arrival itself. Instead, three background loops decide independently whether to act:
   - **`attention_loop`** (every ~90s) — looks at recent messages in active channels and may add a single emoji reaction.
-  - **`autonomy_loop` active mode** (every 5 min) — may chime in with a full unprompted message in an active channel.
-  - **`autonomy_loop` idle mode** (every 5 min) — may say something after a channel's been quiet for a couple of hours.
+  - **`autonomy_loop` active mode** (every 5 min) — may chime in with a full unprompted message in the most relevant active channel.
+  - **`autonomy_loop` idle mode** (every 5 min) — may say something after a guild or independent DM has been quiet long enough.
+
+Boredom is shared across channels in one guild, but not across guilds. The loop chooses at most one destination per guild and a successful message resets that whole guild's boredom, so it cannot march through every inactive channel. Each DM is an independent scope.
 
 **Current-info questions** (news, prices, weather, sports scores, etc.):
 - The bot proposes a web search first ("want me to look that up?"). It only actually searches on the next message if the user agrees.
@@ -126,10 +128,10 @@ All timings, probabilities, cooldowns, and channel restrictions live in `config.
 
 - **`persona.py` → `PERSONA_DESCRIPTION`**: the single highest-leverage lever. Specificity (speech tics, opinions, dislikes, things it wouldn't say) beats length every time.
 - **`examples.txt`**: real conversation excerpts the model reads as a voice reference. Re-loaded per reply.
-- **`config.py` → `AUTONOMY_*` / `ATTENTION_*`**: how often the self-directed loops fire, how likely each is to act, per-channel cooldowns.
+- **`config.py` → `AUTONOMY_*` / `MENTAL_*` / `ATTENTION_*`**: urge thresholds, scope cooldowns, boredom rate, and reaction cadence.
 - **`config.py` → memory depth**: `SHORT_TERM_TURNS` (verbatim context window), `SUMMARIZE_EVERY` (how often profiles are rewritten). Continuity comes from profiles carrying real specifics forward; inspect/edit `sentient_bot.db` in any SQLite browser if a summary drifts weird.
 - **`config.py` → `GUILD_CHANNEL_RESTRICTIONS`**: whitelist channels per guild so the bot only responds in specific rooms.
-- **Mood**: a short free-text phrase updated alongside summarization and injected into the system prompt. Not sticky/decaying yet; that's an easy upgrade if you want it.
+- **Internal state**: energy, valence, curiosity, and social battery drift continuously, react to messages, persist in SQLite, and color prompts without being announced.
 
 ---
 
